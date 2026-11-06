@@ -8,61 +8,67 @@ import java.net.NetworkInterface
  */
 object NetworkUtils {
 
+    private val EXCLUDED_KEYWORDS = listOf("p2p", "tun", "tap", "ppp", "dummy", "rmnet")
+
     /**
      * Inspects NetworkInterfaces to find active, non-loopback IPv4 address across
-     * wlan, ap, rndis, p2p, or eth interfaces.
+     * hotspot, wlan, usb tethering, or ethernet interfaces.
+     *
+     * Filters out virtual, VPN, and peer-to-peer background interfaces (such as
+     * Samsung Quick Share and Wi-Fi Direct) and prioritizes Wi-Fi Sharing / Hotspot interfaces.
      */
     fun getLocalIpAddress(): String? {
         try {
-            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return null
-            val candidates = mutableListOf<Pair<String, String>>() // interfaceName to IP
+            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return "127.0.0.1"
+            val candidateInterfaces = mutableListOf<NetworkInterface>()
 
             while (interfaces.hasMoreElements()) {
-                val networkInterface = interfaces.nextElement()
-                if (!networkInterface.isUp || networkInterface.isLoopback) continue
+                val netInterface = interfaces.nextElement()
+                try {
+                    if (!netInterface.isUp || netInterface.isLoopback) continue
+                } catch (e: Exception) {
+                    continue
+                }
 
-                val interfaceName = networkInterface.name.lowercase()
-                val addresses = networkInterface.inetAddresses
+                val lowerName = netInterface.name.lowercase()
+                if (EXCLUDED_KEYWORDS.any { lowerName.contains(it) }) {
+                    continue
+                }
 
+                candidateInterfaces.add(netInterface)
+            }
+
+            candidateInterfaces.sortBy { getInterfacePriority(it.name) }
+
+            for (netInterface in candidateInterfaces) {
+                val addresses = netInterface.inetAddresses
                 while (addresses.hasMoreElements()) {
                     val address = addresses.nextElement()
-                    if (!address.isLoopbackAddress && address is Inet4Address) {
-                        val ip = address.hostAddress ?: continue
-                        if (ip.isNotEmpty() && !ip.startsWith("127.")) {
-                            candidates.add(Pair(interfaceName, ip))
+                    if (address is Inet4Address && !address.isLoopbackAddress && address.isSiteLocalAddress) {
+                        val host = address.hostAddress
+                        if (!host.isNullOrEmpty() && !host.startsWith("127.")) {
+                            return host
                         }
                     }
                 }
             }
 
-            // Interface priority: wlan > ap / softap > rndis > eth > p2p
-            val preferredInterfaces = listOf("wlan", "ap", "softap", "rndis", "eth", "p2p")
-            for (pref in preferredInterfaces) {
-                val match = candidates.firstOrNull { (name, _) -> name.contains(pref) }
-                if (match != null) return match.second
-            }
-
-            // Fallback to site-local addresses (192.168.x.x, 10.x.x.x, 172.16-31.x.x)
-            val siteLocalMatch = candidates.firstOrNull { (_, ip) ->
-                ip.startsWith("192.168.") || ip.startsWith("10.") || isClassBPrivate(ip)
-            }
-            if (siteLocalMatch != null) return siteLocalMatch.second
-
-            return candidates.firstOrNull()?.second
+            return null
         } catch (e: Exception) {
             e.printStackTrace()
             return null
         }
     }
 
-    private fun isClassBPrivate(ip: String): Boolean {
-        if (!ip.startsWith("172.")) return false
-        val parts = ip.split(".")
-        if (parts.size >= 2) {
-            val second = parts[1].toIntOrNull() ?: return false
-            return second in 16..31
+    private fun getInterfacePriority(name: String): Int {
+        val lower = name.lowercase()
+        return when {
+            lower.startsWith("swlan") || lower.startsWith("ap") -> 0
+            lower == "wlan0" || lower.startsWith("wlan") -> 1
+            lower.startsWith("rndis") || lower.startsWith("ncm") -> 2
+            lower.startsWith("eth") || lower.startsWith("en") -> 3
+            else -> 4
         }
-        return false
     }
 
     fun getFormattedServerUrl(port: Int = 8080): String? {
@@ -70,3 +76,4 @@ object NetworkUtils {
         return "http://$ip:$port"
     }
 }
+

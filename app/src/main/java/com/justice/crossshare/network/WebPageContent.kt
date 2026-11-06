@@ -9,6 +9,7 @@ object WebPageContent {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📁</text></svg>">
     <title>CrossShare - Local File Sharing</title>
     <style>
         :root {
@@ -386,45 +387,45 @@ object WebPageContent {
 
         const formData = new FormData();
         for (let i = 0; i < files.length; i++) {
-            formData.append('file', files[i]);
+            formData.append('file', files[i], files[i].name || ('file_' + i));
+        }
+
+        // Reset fileInput value AFTER appending files to FormData
+        if (fileInput) {
+            fileInput.value = '';
         }
 
         progressSection.style.display = 'block';
-        progressBar.style.width = '0%';
-        progressPercent.innerText = '0%';
+        progressBar.style.width = '50%';
+        progressPercent.innerText = 'Uploading...';
         progressStatus.innerText = 'Uploading ' + files.length + ' file(s)...';
 
-        const xhr = new XMLHttpRequest();
-        xhr.open('POST', '/upload', true);
-
-        xhr.upload.onprogress = function (e) {
-            if (e.lengthComputable) {
-                const percent = Math.round((e.loaded / e.total) * 100);
-                progressBar.style.width = percent + '%';
-                progressPercent.innerText = percent + '%';
-                progressStatus.innerText = 'Uploaded ' + formatBytes(e.loaded) + ' of ' + formatBytes(e.total);
-            }
-        };
-
-        xhr.onload = function () {
-            if (xhr.status >= 200 && xhr.status < 300) {
-                progressBar.style.width = '100%';
-                progressPercent.innerText = '100%';
-                progressStatus.innerText = 'Upload completed successfully!';
-                setTimeout(() => {
-                    progressSection.style.display = 'none';
-                    fetchSharedFiles();
-                }, 2000);
+        fetch('/upload', {
+            method: 'POST',
+            body: formData
+        })
+        .then(response => {
+            if (response.ok) {
+                return response.json();
             } else {
-                progressStatus.innerText = 'Upload failed! Server returned status ' + xhr.status;
+                return response.text().then(text => {
+                    throw new Error('Server returned status ' + response.status + ': ' + text);
+                });
             }
-        };
-
-        xhr.onerror = function () {
-            progressStatus.innerText = 'Network error occurred during upload.';
-        };
-
-        xhr.send(formData);
+        })
+        .then(data => {
+            progressBar.style.width = '100%';
+            progressPercent.innerText = '100%';
+            progressStatus.innerText = 'Upload completed successfully!';
+            setTimeout(() => {
+                progressSection.style.display = 'none';
+                fetchSharedFiles();
+            }, 2000);
+        })
+        .catch(error => {
+            console.error('Upload error:', error);
+            progressStatus.innerText = 'Upload failed! ' + (error.message || error);
+        });
     }
 
     function fetchSharedFiles() {

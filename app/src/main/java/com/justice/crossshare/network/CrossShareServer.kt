@@ -6,6 +6,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import android.util.Log
 import com.justice.crossshare.manager.SharedFileManager
 import com.justice.crossshare.model.SharedFileItem
 import io.ktor.http.ContentType
@@ -13,6 +14,7 @@ import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.content.PartData
+import io.ktor.http.content.forEachPart
 import io.ktor.server.application.install
 import io.ktor.server.cio.CIO
 import io.ktor.server.engine.EmbeddedServer
@@ -68,14 +70,27 @@ class CrossShareServer(private val context: Context) {
                 val engine = embeddedServer(CIO, port = currentPort, host = "0.0.0.0", watchPaths = emptyList()) {
                     install(CORS) {
                         anyHost()
+                        allowHeadersPrefixed("")
                         allowHeader(HttpHeaders.ContentType)
                         allowHeader(HttpHeaders.Authorization)
+                        allowHeader(HttpHeaders.Accept)
+                        allowHeader(HttpHeaders.Origin)
+                        allowHeader(HttpHeaders.UserAgent)
+                        allowHeader(HttpHeaders.AccessControlAllowOrigin)
+                        allowHeader(HttpHeaders.AccessControlAllowHeaders)
                         allowMethod(HttpMethod.Options)
                         allowMethod(HttpMethod.Get)
                         allowMethod(HttpMethod.Post)
+                        allowMethod(HttpMethod.Put)
+                        allowMethod(HttpMethod.Delete)
                     }
 
                     routing {
+                        // Favicon route to prevent browser 400/404 log warnings
+                        get("/favicon.ico") {
+                            call.respond(HttpStatusCode.NoContent)
+                        }
+
                         // Embedded Web Interface
                         get("/") {
                             call.respondText(WebPageContent.getHtml(), ContentType.Text.Html)
@@ -162,25 +177,39 @@ class CrossShareServer(private val context: Context) {
                         // Memory-Safe File Upload Route
                         post("/upload") {
                             try {
-                                val multipart = call.receiveMultipart()
+                                val multipart = call.receiveMultipart(formFieldLimit = 10L * 1024 * 1024 * 1024)
                                 val savedFiles = mutableListOf<SharedFileItem>()
+                                val errorMessages = mutableListOf<String>()
 
-                                while (true) {
-                                    val part = multipart.readPart() ?: break
-                                    when (part) {
-                                        is PartData.FileItem -> {
-                                            val originalName = part.originalFileName ?: "upload_${System.currentTimeMillis()}"
-                                            val sanitizedName = originalName.substringAfterLast("/").substringAfterLast("\\")
-                                            val mimeType = part.contentType?.toString() ?: "application/octet-stream"
-
-                                            val savedItem = saveUploadedFileToDownloads(part, sanitizedName, mimeType)
-                                            if (savedItem != null) {
-                                                SharedFileManager.addReceivedFile(savedItem)
-                                                savedFiles.add(savedItem)
+                                multipart.forEachPart { part ->
+                                    try {
+                                        if (part is PartData.FileItem) {
+                                            val rawName = part.originalFileName
+                                            val sanitizedName = if (rawName.isNullOrBlank()) {
+                                                "upload_${System.currentTimeMillis()}"
+                                            } else {
+                                                rawName.substringAfterLast("/").substringAfterLast("\\")
                                             }
-                                            part.dispose()
+                                            val mimeType = part.contentType?.toString()?.takeIf { it.isNotBlank() } ?: "application/octet-stream"
+
+                                            try {
+                                                val savedItem = saveUploadedFileToDownloads(part, sanitizedName, mimeType)
+                                                if (savedItem != null) {
+                                                    SharedFileManager.addReceivedFile(savedItem)
+                                                    savedFiles.add(savedItem)
+                                                } else {
+                                                    errorMessages.add("Failed to process uploaded file '$sanitizedName'")
+                                                }
+                                            } catch (fileErr: Exception) {
+                                                Log.e("CrossShareServer", "Error saving file '$sanitizedName'", fileErr)
+                                                errorMessages.add("Error saving '$sanitizedName': ${fileErr.message ?: fileErr.javaClass.simpleName}")
+                                            }
                                         }
-                                        else -> part.dispose()
+                                    } catch (partErr: Exception) {
+                                        Log.e("CrossShareServer", "Part parsing error", partErr)
+                                        errorMessages.add("Part error: ${partErr.message ?: partErr.javaClass.simpleName}")
+                                    } finally {
+                                        part.dispose()
                                     }
                                 }
 
@@ -188,14 +217,37 @@ class CrossShareServer(private val context: Context) {
                                     val responseJson = JSONObject().apply {
                                         put("status", "success")
                                         put("uploadedCount", savedFiles.size)
+                                        if (errorMessages.isNotEmpty()) {
+                                            put("warnings", JSONArray(errorMessages))
+                                        }
                                     }
                                     call.respondText(responseJson.toString(), ContentType.Application.Json)
                                 } else {
-                                    call.respond(HttpStatusCode.BadRequest, """{"status":"error","message":"No files uploaded"}""")
+                                    val detailMsg = if (errorMessages.isNotEmpty()) {
+                                        errorMessages.joinToString("; ")
+                                    } else {
+                                        "No valid files found in upload payload"
+                                    }
+                                    Log.e("CrossShareServer", "Upload rejected: $detailMsg")
+                                    call.respondText(
+                                        JSONObject().apply {
+                                            put("status", "error")
+                                            put("message", detailMsg)
+                                        }.toString(),
+                                        ContentType.Application.Json,
+                                        HttpStatusCode.BadRequest
+                                    )
                                 }
                             } catch (e: Exception) {
-                                e.printStackTrace()
-                                call.respond(HttpStatusCode.InternalServerError, """{"status":"error","message":"${e.message}"}""")
+                                Log.e("CrossShareServer", "Upload route failed", e)
+                                call.respondText(
+                                    JSONObject().apply {
+                                        put("status", "error")
+                                        put("message", e.message ?: "Upload route failed")
+                                    }.toString(),
+                                    ContentType.Application.Json,
+                                    HttpStatusCode.InternalServerError
+                                )
                             }
                         }
                     }
@@ -256,65 +308,105 @@ class CrossShareServer(private val context: Context) {
         var savedFile: File? = null
         var totalBytesCopied: Long = 0
 
-        // Android 10+ (API 29+) MediaStore Downloads
+        val safeMimeType = if (mimeType.isBlank() || mimeType == "null") "application/octet-stream" else mimeType
+
+        // 1. Primary Save Method: MediaStore.Downloads (Android 10+ / API 29+)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val contentValues = ContentValues().apply {
-                put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
-                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/CrossShare")
-                put(MediaStore.MediaColumns.IS_PENDING, 1)
-            }
-
-            val collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI
-            savedUri = resolver.insert(collection, contentValues)
-
-            if (savedUri != null) {
-                try {
-                    resolver.openOutputStream(savedUri)?.use { outputStream ->
-                        totalBytesCopied = streamPartData(filePart, outputStream)
-                    }
-                    contentValues.clear()
-                    contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
-                    resolver.update(savedUri, contentValues, null, null)
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                    resolver.delete(savedUri, null, null)
-                    savedUri = null
+            try {
+                val contentValues = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                    put(MediaStore.MediaColumns.MIME_TYPE, safeMimeType)
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/CrossShare")
+                    put(MediaStore.MediaColumns.IS_PENDING, 1)
                 }
+
+                val collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI
+                savedUri = resolver.insert(collection, contentValues)
+
+                if (savedUri != null) {
+                    try {
+                        resolver.openOutputStream(savedUri)?.use { outputStream ->
+                            totalBytesCopied = streamPartData(filePart, outputStream)
+                        }
+                        contentValues.clear()
+                        contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                        resolver.update(savedUri, contentValues, null, null)
+                    } catch (writeErr: Exception) {
+                        Log.e("CrossShareServer", "Failed writing to MediaStore Uri $savedUri", writeErr)
+                        try {
+                            resolver.delete(savedUri, null, null)
+                        } catch (ignored: Exception) {}
+                        savedUri = null
+                    }
+                }
+            } catch (insertErr: Exception) {
+                Log.e("CrossShareServer", "MediaStore insert failed, falling back to File I/O", insertErr)
+                savedUri = null
             }
         }
 
-        // Fallback for API < 29 or if MediaStore insert was null
+        // 2. Fallback Save Method: Direct java.io.File with ENOTDIR & Scoped Storage Collisions Protection
         if (savedUri == null) {
             try {
                 val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                val crossShareDir = File(downloadsDir, "CrossShare")
-                if (!crossShareDir.exists()) {
-                    crossShareDir.mkdirs()
+                if (!downloadsDir.exists()) {
+                    downloadsDir.mkdirs()
                 }
-                var targetFile = File(crossShareDir, fileName)
-                if (targetFile.exists()) {
-                    val nameWithoutExt = fileName.substringBeforeLast(".")
-                    val ext = if (fileName.contains(".")) ".${fileName.substringAfterLast(".")}" else ""
-                    targetFile = File(crossShareDir, "${nameWithoutExt}_${System.currentTimeMillis()}$ext")
+
+                val subDir = File(downloadsDir, "CrossShare")
+                if (subDir.exists() && !subDir.isDirectory) {
+                    // Collision protection: subDir exists as a file, attempt deletion
+                    try {
+                        subDir.delete()
+                    } catch (e: Exception) {
+                        Log.e("CrossShareServer", "Could not delete file named CrossShare in Downloads", e)
+                    }
                 }
-                targetFile.outputStream().use { outputStream ->
-                    totalBytesCopied = streamPartData(filePart, outputStream)
+
+                val targetDir = if (subDir.isDirectory || (!subDir.exists() && subDir.mkdirs())) {
+                    subDir
+                } else {
+                    // ENOTDIR protection: fall back directly to downloadsDir if subDir is not a directory
+                    downloadsDir
                 }
+
+                val nameWithoutExt = if (fileName.contains(".")) fileName.substringBeforeLast(".") else fileName
+                val ext = if (fileName.contains(".")) ".${fileName.substringAfterLast(".")}" else ""
+
+                var targetFile = File(targetDir, fileName)
+                var counter = 0
+                while (targetFile.exists()) {
+                    counter++
+                    targetFile = File(targetDir, "${nameWithoutExt}_${System.currentTimeMillis()}_$counter$ext")
+                }
+
+                try {
+                    targetFile.outputStream().use { outputStream ->
+                        totalBytesCopied = streamPartData(filePart, outputStream)
+                    }
+                } catch (streamErr: Exception) {
+                    Log.e("CrossShareServer", "FileOutputStream failed on $targetFile, trying unique fallback name", streamErr)
+                    val fallbackFile = File(targetDir, "${nameWithoutExt}_${System.currentTimeMillis()}_fallback$ext")
+                    fallbackFile.outputStream().use { outputStream ->
+                        totalBytesCopied = streamPartData(filePart, outputStream)
+                    }
+                    targetFile = fallbackFile
+                }
+
                 savedFile = targetFile
                 savedUri = Uri.fromFile(targetFile)
-            } catch (e: Exception) {
-                e.printStackTrace()
-                return null
+            } catch (fileErr: Exception) {
+                Log.e("CrossShareServer", "Direct File save failed completely", fileErr)
+                throw fileErr
             }
         }
 
         val finalUri = savedUri ?: return null
 
         return SharedFileItem(
-            name = fileName,
+            name = savedFile?.name ?: fileName,
             size = totalBytesCopied,
-            mimeType = mimeType,
+            mimeType = safeMimeType,
             uri = finalUri,
             file = savedFile,
             isReceived = true

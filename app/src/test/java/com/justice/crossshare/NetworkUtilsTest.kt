@@ -2,6 +2,7 @@ package com.justice.crossshare
 
 import com.justice.crossshare.network.NetworkUtils
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -10,7 +11,6 @@ class NetworkUtilsTest {
     @Test
     fun testGetLocalIpAddress() {
         val ip = NetworkUtils.getLocalIpAddress()
-        // If connected to network or loopback interface exists, ip might or might not be null on test JVM
         if (ip != null) {
             assertTrue(ip.isNotEmpty())
             assertTrue(!ip.startsWith("127."))
@@ -25,6 +25,9 @@ class NetworkUtilsTest {
             assertNotNull(url)
             assertTrue(url!!.startsWith("http://"))
             assertTrue(url.endsWith(":8080"))
+        } else {
+            assertNull(url)
         }
     }
 }
+

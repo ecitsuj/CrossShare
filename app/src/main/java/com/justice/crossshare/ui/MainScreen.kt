@@ -128,11 +128,13 @@ fun MainScreen() {
     val sharedFiles by SharedFileManager.sharedFiles.collectAsStateWithLifecycle()
     val receivedFiles by SharedFileManager.receivedFiles.collectAsStateWithLifecycle()
 
-    // Permission launcher for POST_NOTIFICATIONS on Android 13+
-    val notificationPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission()
-    ) { _ ->
-        FileSharingService.startService(context)
+    // Permission launcher for runtime permissions (POST_NOTIFICATIONS on Android 13+, ACCESS_LOCAL_NETWORK on Android 17+)
+    val permissionsLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        if (permissions.values.all { it }) {
+            FileSharingService.startService(context)
+        }
     }
 
     // File picker launcher
@@ -148,15 +150,26 @@ fun MainScreen() {
     }
 
     fun handleStartServer() {
+        val permissionsToRequest = mutableListOf<String>()
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val permission = Manifest.permission.POST_NOTIFICATIONS
-            if (ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED) {
-                FileSharingService.startService(context)
-            } else {
-                notificationPermissionLauncher.launch(permission)
+            val notifPerm = Manifest.permission.POST_NOTIFICATIONS
+            if (ContextCompat.checkSelfPermission(context, notifPerm) != PackageManager.PERMISSION_GRANTED) {
+                permissionsToRequest.add(notifPerm)
             }
-        } else {
+        }
+
+        if (Build.VERSION.SDK_INT >= 37 /* Android 17+ (API 37+) */) {
+            val localNetworkPerm = Manifest.permission.ACCESS_LOCAL_NETWORK
+            if (ContextCompat.checkSelfPermission(context, localNetworkPerm) != PackageManager.PERMISSION_GRANTED) {
+                permissionsToRequest.add(localNetworkPerm)
+            }
+        }
+
+        if (permissionsToRequest.isEmpty()) {
             FileSharingService.startService(context)
+        } else {
+            permissionsLauncher.launch(permissionsToRequest.toTypedArray())
         }
     }
 
